@@ -1,0 +1,115 @@
+diff -ruN old/matrix/README.md new/matrix/README.md
+--- old/matrix/README.md
++++ new/matrix/README.md
+@@ -83,8 +83,8 @@
+ # Symbalyx base overrides
+-enable_registration: false
+-enable_registration_without_verification: false
++enable_registration: true
++enable_registration_without_verification: true
+ password_config:
+   enabled: true
+@@ -172,9 +172,12 @@
+-## ETAPE 5 - Creer les 10 comptes utilisateurs
++## ETAPE 5 - Creer les comptes utilisateurs
+-L'enregistrement public est desactive : on cree chaque compte via la CLI admin du conteneur.
++La UI Symbalyx permet maintenant de creer un compte depuis l'ecran Premiere connexion.
++Pour que ce bouton fonctionne, verifier que enable_registration true et enable_registration_without_verification true sont bien presents dans data/synapse/homeserver.yaml apres application des overrides.
++Option alternative plus verrouillee : creer les comptes via la CLI admin du conteneur.
+@@ -201,6 +204,8 @@
+ | http://localhost:8090 | UI custom Symbalyx |
++Sur telephone, utilisez http://IP_DU_PC:8090 et non localhost. La UI detecte maintenant automatiquement l'IP utilisee pour appeler Matrix.
++
+diff -ruN old/matrix/config/synapse-overrides-v2.yaml new/matrix/config/synapse-overrides-v2.yaml
+--- old/matrix/config/synapse-overrides-v2.yaml
++++ new/matrix/config/synapse-overrides-v2.yaml
+@@ -8,6 +8,13 @@
+ public_baseurl: "http://localhost:8008"
++
++# Inscription locale depuis la UI Symbalyx
++# Necessaire pour que le bouton Creer mon compte fonctionne.
++# A utiliser seulement sur un reseau prive LAN non expose publiquement.
++enable_registration: true
++enable_registration_without_verification: true
++
+ # MatrixRTC
+
+diff -ruN old/matrix/ui/index.html new/matrix/ui/index.html
+--- old/matrix/ui/index.html
++++ new/matrix/ui/index.html
+@@ -2737,15 +2737,26 @@
++const APP_HOST = (window.location.hostname && window.location.hostname !== "") ? window.location.hostname : "localhost";
++const APP_PROTO = window.location.protocol === "https:" ? "https" : "http";
++const APP_ORIGIN = (window.location.origin && window.location.origin !== "null") ? window.location.origin : `${APP_PROTO}://${APP_HOST}`;
++const IS_SINGLE_ORIGIN = window.location.port === "8443";
++
+ const CONFIG = {
+   brandName: "Symbalyx",
+-  homeserver: "http://localhost:8008",
+-  elementUrl: "http://localhost:8080",
+-  elementCall: "http://localhost:8181",
+-  whisperUrl: "http://localhost:9000",
+-  serverName: "localhost"
++  homeserver: IS_SINGLE_ORIGIN ? "" : `${APP_PROTO}://${APP_HOST}:8008`,
++  elementUrl: IS_SINGLE_ORIGIN ? `${APP_ORIGIN}/element/` : `${APP_PROTO}://${APP_HOST}:8080`,
++  elementCall: IS_SINGLE_ORIGIN ? `${APP_ORIGIN}/call/` : `${APP_PROTO}://${APP_HOST}:8181`,
++  whisperUrl: IS_SINGLE_ORIGIN ? `${APP_ORIGIN}/whisper` : `${APP_PROTO}://${APP_HOST}:9000`,
++  serverName: APP_HOST === "127.0.0.1" ? "localhost" : APP_HOST
+ };
+@@ -2771,30 +2782,57 @@
+-    const res = await fetch(`${this.hs}${path}`, {
+-      method, headers,
+-      body: body ? JSON.stringify(body) : undefined
+-    });
++    let res;
++    try {
++      res = await fetch(`${this.hs}${path}`, {
++        method, headers,
++        body: body ? JSON.stringify(body) : undefined
++      });
++    } catch (networkErr) {
++      const err = new Error(`Serveur Matrix injoignable (${this.hs || APP_ORIGIN}). Verifie que Docker tourne et que tu ouvres l'app avec l'IP du PC, pas localhost sur telephone.`);
++      err.code = "NETWORK_ERROR";
++      throw err;
++    }
+@@ - login function
+-    const data = await this.req("POST", "/_matrix/client/v3/login", {
+-      type: "m.login.password",
+-      identifier: { type: "m.id.user", user },
+-      password: pass,
+-      initial_device_display_name: "Mobile"
+-    });
++    const cleanUser = String(user || "").trim();
++    const attempts = [cleanUser];
++    if (cleanUser && !cleanUser.startsWith("@")) {
++      attempts.push(`@${cleanUser}:${CONFIG.serverName}`);
++      if (CONFIG.serverName !== "localhost") attempts.push(`@${cleanUser}:localhost`);
++    }
++    let lastErr = null;
++    for (const candidate of [...new Set(attempts)]) {
++      try {
++        const data = await this.req("POST", "/_matrix/client/v3/login", {
++          type: "m.login.password",
++          identifier: { type: "m.id.user", user: candidate },
++          password: pass,
++          initial_device_display_name: "Symbalyx UI"
++        });
++        this.token = data.access_token;
++        this.userId = data.user_id;
++        this.deviceId = data.device_id;
++        return data;
++      } catch (err) {
++        lastErr = err;
++        if (err.code === "NETWORK_ERROR" || err.status >= 500) break;
++      }
++    }
++    throw lastErr || new Error("Identifiants invalides");
+@@ -3303,13 +3368,15 @@
++Afficher une erreur lisible si Matrix est injoignable, si l'inscription est desactivee, ou si l'identifiant existe deja.
+
+diff -ruN old/matrix/ui/service-worker.js new/matrix/ui/service-worker.js
+--- old/matrix/ui/service-worker.js
++++ new/matrix/ui/service-worker.js
+@@ -1,7 +1,7 @@
+-const CACHE = "app-cache-v4";
++const CACHE = "app-cache-v5-login-fix";
